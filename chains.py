@@ -25,6 +25,7 @@ from typing import List, Any
 from utils import BaseLogger, extract_title_and_question
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
+from pyvis.network import Network
 
 def load_embedding_model(embedding_model_name: str, logger=BaseLogger(), config={}):
     if embedding_model_name == "ollama":
@@ -152,22 +153,22 @@ def configure_qa_rag_chain(llm, embeddings, embeddings_store_url, username, pass
         password=password,
         database="neo4j",  # neo4j by default
         index_name="stackoverflow",  # vector by default
-        text_node_property="body",  # text by default
-        retrieval_query="""
-    WITH node AS question, score AS similarity
-    CALL  { with question
-        MATCH (question)<-[:ANSWERS]-(answer)
-        WITH answer
-        ORDER BY answer.is_accepted DESC, answer.score DESC
-        WITH collect(answer)[..2] as answers
-        RETURN reduce(str='', answer IN answers | str + 
-                '\n### Answer (Accepted: '+ answer.is_accepted +
-                ' Score: ' + answer.score+ '): '+  answer.body + '\n') as answerTexts
-    } 
-    RETURN '##Question: ' + question.title + '\n' + question.body + '\n' 
-        + answerTexts AS text, similarity as score, {source: question.link} AS metadata
-    ORDER BY similarity ASC // so that best answers are the last
-    """,
+        text_node_propeymlrty="body",  # text by default
+    #     retrieval_query="""
+    # WITH node AS question, score AS similarity
+    # CALL  { with question
+    #     MATCH (question)<-[:ANSWERS]-(answer)
+    #     WITH answer
+    #     ORDER BY answer.is_accepted DESC, answer.score DESC
+    #     WITH collect(answer)[..2] as answers
+    #     RETURN reduce(str='', answer IN answers | str + 
+    #             '\n### Answer (Accepted: '+ answer.is_accepted +
+    #             ' Score: ' + answer.score+ '): '+  answer.body + '\n') as answerTexts
+    # } 
+    # RETURN '##Question: ' + question.title + '\n' + question.body + '\n' 
+    #     + answerTexts AS text, similarity as score, {source: question.link} AS metadata
+    # ORDER BY similarity ASC // so that best answers are the last
+    # """,
     )
 
     kg_qa = RetrievalQAWithSourcesChain(

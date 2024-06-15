@@ -149,13 +149,3 @@ async def ask(question: Question = Depends()):
     )
 
     return {"result": result["answer"], "model": llm_name}
-
-
-@app.get("/generate-ticket")
-async def generate_ticket_api(question: BaseTicket = Depends()):
-    new_title, new_question = generate_ticket(
-        neo4j_graph=neo4j_graph,
-        llm_chain=llm_chain,
-        input_question=question.text,
-    )
-    return {"result": {"title": new_title, "text": new_question}, "model": llm_name}
