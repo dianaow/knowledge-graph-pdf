@@ -20,4 +20,4 @@ langchain-google-genai
 
 networkx 
 pyvis
-pypdf
+llmsherpa

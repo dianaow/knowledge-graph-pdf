@@ -1,127 +1,52 @@
 import os
-import json
-import pandas as pd
-from tqdm import tqdm
-import tempfile
 
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit.logger import get_logger
+import streamlit.components.v1 as components
 
-import networkx as nx
-from pyvis.network import Network
-
-from langchain.chains import RetrievalQA
-from langchain_community.graphs import Neo4jGraph
 from langchain.callbacks.base import BaseCallbackHandler
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Neo4jVector
-from langchain.prompts import ChatPromptTemplate
-from langchain.chains.openai_functions import (
-    create_structured_output_chain
-)
-from langchain_openai import ChatOpenAI
-from langchain_community.graphs.graph_document import (
-    Node as BaseNode,
-    Relationship as BaseRelationship,
-    GraphDocument,
-)
-from langchain.schema import Document
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.graphs.graph_document import (
-    Node as BaseNode,
-    Relationship as BaseRelationship,
-    GraphDocument,
-)
-from typing import List, Dict, Any, Optional
-from langchain.pydantic_v1 import Field, BaseModel
+#from langchain.graphs import Neo4jGraph
+from neo4j import GraphDatabase
+from dotenv import load_dotenv
+import hashlib
+import glob
+
+#import networkx as nx
+#from pyvis.network import Network
 
 from chains import (
     load_embedding_model,
     load_llm,
+    configure_llm_only_chain,
+    configure_qa_structure_rag_chain,
 )
 
-class Property(BaseModel):
-    """A single property consisting of key and value"""
-    key: str = Field(..., description="key")
-    value: str = Field(..., description="value")
 
-class Node(BaseNode):
-    properties: Optional[List[Property]] = Field(
-        None, description="List of node properties")
-
-class Relationship(BaseRelationship):
-    properties: Optional[List[Property]] = Field(
-        None, description="List of relationship properties"
-    )
-
-class KnowledgeGraph(BaseModel):
-    """Generate a knowledge graph with entities and relationships."""
-    nodes: List[Node] = Field(
-        ..., description="List of nodes in the knowledge graph")
-    edges: List[Relationship] = Field(
-        ..., description="List of relationships in the knowledge graph"
-    )
-
-def format_property_key(s: str) -> str:
-    words = s.split()
-    if not words:
-        return s
-    first_word = words[0].lower()
-    capitalized_words = [word.capitalize() for word in words[1:]]
-    return "".join([first_word] + capitalized_words)
-
-def props_to_dict(props) -> dict:
-    """Convert properties to a dictionary."""
-    properties = {}
-    if not props:
-      return properties
-    for p in props:
-        properties[format_property_key(p.key)] = p.value
-    return properties
-
-def map_to_base_node(node: Node) -> BaseNode:
-    """Map the KnowledgeGraph Node to the base Node."""
-    properties = props_to_dict(node.properties) if node.properties else {}
-    # Add name property for better Cypher statement generation
-    properties["name"] = node.id.title()
-    return BaseNode(
-        id=node.id.title(), type=node.type.capitalize(), properties=properties
-    )
-
-def map_to_base_relationship(rel: Relationship) -> BaseRelationship:
-    """Map the KnowledgeGraph Relationship to the base Relationship."""
-    source = map_to_base_node(rel.source)
-    target = map_to_base_node(rel.target)
-    properties = props_to_dict(rel.properties) if rel.properties else {}
-    return BaseRelationship(
-        source=source, target=target, type=rel.type, properties=properties
-    )
-  
-
-# load api key lib
-from dotenv import load_dotenv
+from llmsherpa.readers import LayoutPDFReader
+llmsherpa_api_url = "https://readers.llmsherpa.com/api/document/developer/parseDocument?renderFormat=all"
+pdf_reader = LayoutPDFReader(llmsherpa_api_url)
 
 load_dotenv(".env")
 
 url = os.getenv("NEO4J_URI")
 username = os.getenv("NEO4J_USERNAME")
 password = os.getenv("NEO4J_PASSWORD")
+database = os.getenv("NEO4J_DATABASE")
 ollama_base_url = os.getenv("OLLAMA_BASE_URL")
 embedding_model_name = os.getenv("EMBEDDING_MODEL")
-llm_name = os.getenv("LLM")
+#llm_name = os.getenv("LLM")
+llm_name = 'gpt-3.5'
 # Remapping for Langchain Neo4j integration
-os.environ["NEO4J_URL"] = url
+# os.environ["NEO4J_URL"] = url
 
 logger = get_logger(__name__)
 
-
+#neo4j_graph = Neo4jGraph(url=url, username=username, password=password, database=database)
 embeddings, dimension = load_embedding_model(
     embedding_model_name, config={"ollama_base_url": ollama_base_url}, logger=logger
 )
+llm = load_llm(llm_name, logger=logger, config={"ollama_base_url": ollama_base_url})
 
-# if Neo4j is local, you can go to http://localhost:7474/ to browse the database
-neo4j_graph = Neo4jGraph(url=url, username=username, password=password)
 
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, container, initial_text=""):
@@ -132,176 +57,400 @@ class StreamHandler(BaseCallbackHandler):
         self.text += token
         self.container.markdown(self.text)
 
-#llm = load_llm(llm_name, logger=logger, config={"ollama_base_url": ollama_base_url})
-llm = ChatOpenAI(model="gpt-3.5-turbo-16k", temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY"))
+
+def chat_input():
+    user_input = st.chat_input("What questions can I help you resolve today?")
+
+    if user_input:
+        with st.chat_message("user"):
+            st.write(user_input)
+        with st.chat_message("assistant"):
+            st.caption(f"RAG: {name}")
+            stream_handler = StreamHandler(st.empty())
+
+            # Call chain to generate answers
+            result = output_function(
+                {"question": user_input, "chat_history": []}, callbacks=[stream_handler]
+            )["answer"]
+
+            st.session_state[f"user_input"].append(user_input)
+            st.session_state[f"generated"].append(result)
+            st.session_state[f"rag_mode"].append(name)
 
 
-# Function to process PDF files
-def process_pdf(file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(file.read())
-        tmp_file_path = tmp_file.name
+def display_chat():
+    # Session state
+    if "generated" not in st.session_state:
+        st.session_state[f"generated"] = []
 
-    loader = PyPDFLoader(tmp_file_path)
-    pages = loader.load_and_split()
-    return pages
+    if "user_input" not in st.session_state:
+        st.session_state[f"user_input"] = []
 
-# Function to process CSV files
-def process_csv(file):
-    df = pd.read_csv(file)
-    return df
+    if "rag_mode" not in st.session_state:
+        st.session_state[f"rag_mode"] = []
 
-# Function to process JSON files
-def process_json(file):
-    file_content = file.read().decode("utf-8")
-    data = json.load(file_content)
-    return data
+    if st.session_state[f"generated"]:
+        size = len(st.session_state[f"generated"])
+        # Display only the last three exchanges
+        for i in range(max(size - 3, 0), size):
+            with st.chat_message("user"):
+                st.write(st.session_state[f"user_input"][i])
 
-def main():
-    uploaded_files = st.file_uploader("Choose a file", type=["pdf", "csv", "json"], accept_multiple_files=True)
-    st.write("Upload a single or multiple files in either PDF, CSV or JSON format to generate a graph. For CSV format, it is required to upload separate CSV files of nodes and edges. For JSON format, ensure there are both node and edge data objects in a single JSON file.")
+            with st.chat_message("assistant"):
+                st.caption(f"RAG: {st.session_state[f'rag_mode'][i]}")
+                st.write(st.session_state[f"generated"][i])
 
-    if len(uploaded_files) is not 0:
-        if st.button('Generate Graph'):
-            for uploaded_file in uploaded_files:
-                file_type = uploaded_file.type
+        with st.container():
+            st.write("&nbsp;")
 
-                if file_type == "application/pdf":
-                    raw_documents = process_pdf(uploaded_file)
 
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1500, chunk_overlap=200, length_function=len
-                    )
-                    documents = text_splitter.split_documents(raw_documents)
+def mode_select() -> str:
+    options = ["Disabled", "Enabled"]
+    return st.radio("Select RAG mode", options, horizontal=True)
+
+# def open_sidebar():
+#     st.session_state.open_sidebar = True
+
+
+# def close_sidebar():
+#     st.session_state.open_sidebar = False
+
+# st.button(
+#     "Show Graph",
+#     type="primary",
+#     key="show_graph",
+#     on_click=open_sidebar,
+# )
+
+# def retrieve_graph():
+#     query = """
+#     MATCH (n)-[r]->(m) RETURN n, r, m
+#     """
+#     records = neo4j_graph.query(query)
+#     return records
+
+# def draw_graph(records):
+#     # Create a NetworkX graph
+#     G = nx.Graph()
+
+#     # Process records to add nodes and edges
+#     for record in records:
+#         node_n = record['n']
+#         node_m = record['m']
+#         edge = record['r']
+#         print('NODE', node_n)
+#         # Add nodes with attributes
+#         G.add_node(node_n['id'], **node_n)
+#         G.add_node(node_m['id'], **node_m)
+        
+#         # Add edge with type
+#         G.add_edge(edge[0]['id'], edge[2]['id'], type=edge[1])
+
+
+#     # Create a PyVis network
+#     net = Network(notebook=True)
+#     net.from_nx(G)
+
+#     # Save and read graph as HTML file (streamlit can't directly display from PyVis)
+#     net.show("graph.html")
+#     HtmlFile = open("graph.html", "r", encoding="utf-8")
+
+#     # Load HTML file in Streamlit and display it
+#     source_code = HtmlFile.read()
+#     components.html(source_code, height=600)
+
+# if not "open_sidebar" in st.session_state:
+#     st.session_state.open_sidebar = False
+# if st.session_state.open_sidebar:
+#     records = retrieve_graph()
+#     draw_graph(records)
+
+def initialiseNeo4j():
+    cypher_schema = [
+        "CREATE CONSTRAINT sectionKey IF NOT EXISTS FOR (c:Section) REQUIRE (c.key) IS UNIQUE;",
+        "CREATE CONSTRAINT chunkKey IF NOT EXISTS FOR (c:Chunk) REQUIRE (c.key) IS UNIQUE;",
+        "CREATE CONSTRAINT documentKey IF NOT EXISTS FOR (c:Document) REQUIRE (c.url_hash) IS UNIQUE;",
+        "CREATE CONSTRAINT tableKey IF NOT EXISTS FOR (c:Table) REQUIRE (c.key) IS UNIQUE;",
+        "CALL db.index.vector.createNodeIndex('chunkVectorIndex', 'Embedding', 'value', 1536, 'COSINE');"
+    ]
+
+    driver = GraphDatabase.driver(url, database=database, auth=(username, password))
+
+    with driver.session() as session:
+        for cypher in cypher_schema:
+            session.run("DROP INDEX chunkVectorIndex IF EXISTS")
+            session.run(cypher)
+    driver.close()
+
+def ingestDocumentNeo4j(doc, doc_location):
+
+    cypher_pool = [
+        # 0 - Document
+        "MERGE (d:Document {url_hash: $doc_url_hash_val}) ON CREATE SET d.url = $doc_url_val RETURN d;",  
+        # 1 - Section
+        "MERGE (p:Section {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$title_hash_val}) ON CREATE SET p.page_idx = $page_idx_val, p.title_hash = $title_hash_val, p.block_idx = $block_idx_val, p.title = $title_val, p.tag = $tag_val, p.level = $level_val RETURN p;",
+        # 2 - Link Section with the Document
+        "MATCH (d:Document {url_hash: $doc_url_hash_val}) MATCH (s:Section {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$title_hash_val}) MERGE (d)<-[:HAS_DOCUMENT]-(s);",
+        # 3 - Link Section with a parent section
+        "MATCH (s1:Section {key: $doc_url_hash_val+'|'+$parent_block_idx_val+'|'+$parent_title_hash_val}) MATCH (s2:Section {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$title_hash_val}) MERGE (s1)<-[:UNDER_SECTION]-(s2);",
+        # 4 - Chunk
+        "MERGE (c:Chunk {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$sentences_hash_val}) ON CREATE SET c.sentences = $sentences_val, c.sentences_hash = $sentences_hash_val, c.block_idx = $block_idx_val, c.page_idx = $page_idx_val, c.tag = $tag_val, c.level = $level_val RETURN c;",
+        # 5 - Link Chunk to Section
+        "MATCH (c:Chunk {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$sentences_hash_val}) MATCH (s:Section {key:$doc_url_hash_val+'|'+$parent_block_idx_val+'|'+$parent_hash_val}) MERGE (s)<-[:HAS_PARENT]-(c);",
+        # 6 - Table
+        "MERGE (t:Table {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$name_val}) ON CREATE SET t.name = $name_val, t.doc_url_hash = $doc_url_hash_val, t.block_idx = $block_idx_val, t.page_idx = $page_idx_val, t.html = $html_val, t.rows = $rows_val RETURN t;",
+        # 7 - Link Table to Section
+        "MATCH (t:Table {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$name_val}) MATCH (s:Section {key: $doc_url_hash_val+'|'+$parent_block_idx_val+'|'+$parent_hash_val}) MERGE (s)<-[:HAS_PARENT]-(t);",
+        # 8 - Link Table to Document if no parent section
+        "MATCH (t:Table {key: $doc_url_hash_val+'|'+$block_idx_val+'|'+$name_val}) MATCH (s:Document {url_hash: $doc_url_hash_val}) MERGE (s)<-[:HAS_PARENT]-(t);"
+    ]
+
+    driver = GraphDatabase.driver(url, database=database, auth=(username, password))
+
+    with driver.session() as session:
+        cypher = ""
+
+        # 1 - Create Document node
+        doc_url_val = doc_location
+        doc_url_hash_val = hashlib.md5(doc_url_val.encode("utf-8")).hexdigest()
+
+        cypher = cypher_pool[0]
+        session.run(cypher, doc_url_hash_val=doc_url_hash_val, doc_url_val=doc_url_val)
+
+        # 2 - Create Section nodes
+        
+        countSection = 0
+        for sec in doc.sections():
+            sec_title_val = sec.title
+            sec_title_hash_val = hashlib.md5(sec_title_val.encode("utf-8")).hexdigest()
+            sec_tag_val = sec.tag
+            sec_level_val = sec.level
+            sec_page_idx_val = sec.page_idx
+            sec_block_idx_val = sec.block_idx
+
+            # MERGE section node
+            if not sec_tag_val == 'table':
+                cypher = cypher_pool[1]
+                session.run(cypher, page_idx_val=sec_page_idx_val
+                                , title_hash_val=sec_title_hash_val
+                                , title_val=sec_title_val
+                                , tag_val=sec_tag_val
+                                , level_val=sec_level_val
+                                , block_idx_val=sec_block_idx_val
+                                , doc_url_hash_val=doc_url_hash_val
+                            )
+
+                # Link Section with a parent section or Document
+
+                sec_parent_val = str(sec.parent.to_text())
+
+                if sec_parent_val == "None":    # use Document as parent
+
+                    cypher = cypher_pool[2]
+                    session.run(cypher, page_idx_val=sec_page_idx_val
+                                    , title_hash_val=sec_title_hash_val
+                                    , doc_url_hash_val=doc_url_hash_val
+                                    , block_idx_val=sec_block_idx_val
+                                )
+
+                else:   # use parent section
+                    sec_parent_title_hash_val = hashlib.md5(sec_parent_val.encode("utf-8")).hexdigest()
+                    sec_parent_page_idx_val = sec.parent.page_idx
+                    sec_parent_block_idx_val = sec.parent.block_idx
+
+                    cypher = cypher_pool[3]
+                    session.run(cypher, page_idx_val=sec_page_idx_val
+                                    , title_hash_val=sec_title_hash_val
+                                    , block_idx_val=sec_block_idx_val
+                                    , parent_page_idx_val=sec_parent_page_idx_val
+                                    , parent_title_hash_val=sec_parent_title_hash_val
+                                    , parent_block_idx_val=sec_parent_block_idx_val
+                                    , doc_url_hash_val=doc_url_hash_val
+                                )
+            # **** if sec_parent_val == "None":    
+
+            countSection += 1
+        # **** for sec in doc.sections():
+
+        
+        # ------- Continue within the blocks -------
+        # 3 - Create Chunk nodes from chunks
+            
+        countChunk = 0
+        for chk in doc.chunks():
+
+            chunk_block_idx_val = chk.block_idx
+            chunk_page_idx_val = chk.page_idx
+            chunk_tag_val = chk.tag
+            chunk_level_val = chk.level
+            chunk_sentences = "\n".join(chk.sentences)
+
+            # MERGE Chunk node
+            if not chunk_tag_val == 'table':
+                chunk_sentences_hash_val = hashlib.md5(chunk_sentences.encode("utf-8")).hexdigest()
+
+                # MERGE chunk node
+                cypher = cypher_pool[4]
+                session.run(cypher, sentences_hash_val=chunk_sentences_hash_val
+                                , sentences_val=chunk_sentences
+                                , block_idx_val=chunk_block_idx_val
+                                , page_idx_val=chunk_page_idx_val
+                                , tag_val=chunk_tag_val
+                                , level_val=chunk_level_val
+                                , doc_url_hash_val=doc_url_hash_val
+                            )
+            
+                # Link chunk with a section
+                # Chunk always has a parent section 
+
+                chk_parent_val = str(chk.parent.to_text())
+                
+                if not chk_parent_val == "None":
+                    chk_parent_hash_val = hashlib.md5(chk_parent_val.encode("utf-8")).hexdigest()
+                    chk_parent_page_idx_val = chk.parent.page_idx
+                    chk_parent_block_idx_val = chk.parent.block_idx
+
+                    cypher = cypher_pool[5]
+                    session.run(cypher, sentences_hash_val=chunk_sentences_hash_val
+                                    , block_idx_val=chunk_block_idx_val
+                                    , parent_hash_val=chk_parent_hash_val
+                                    , parent_block_idx_val=chk_parent_block_idx_val
+                                    , doc_url_hash_val=doc_url_hash_val
+                                )
                     
-                    for i, d in tqdm(enumerate(documents), total=len(documents)):
-                        extract_and_store_graph(d)
+                # Link sentence 
+                #   >> TO DO for smaller token length
 
-                elif file_type == "text/csv":
-                    return
-                elif file_type == "application/json":
-                    json_data = process_json(uploaded_file)
-                    df_nodes = pd.DataFrame(json_data['nodes'])
-                    df_edges = pd.DataFrame(json_data['edges'])
-                    insert_data(df_nodes, df_edges)
-                    #insert_query_data(json_data)
-                else:
-                    st.write("Unsupported file type.")
+                countChunk += 1
+        # **** for chk in doc.chunks(): 
 
+        # 4 - Create Table nodes
 
-            if uploaded_files[0] == "text/csv":
-                df_nodes = process_csv(uploaded_files[0])
-                df_edges = process_csv(uploaded_files[1])
-                insert_data(df_nodes, df_edges)
+        countTable = 0
+        for tb in doc.tables():
+            page_idx_val = tb.page_idx
+            block_idx_val = tb.block_idx
+            name_val = 'block#' + str(block_idx_val) + '_' + tb.name
+            html_val = tb.to_html()
+            rows_val = len(tb.rows)
+
+            # MERGE table node
+
+            cypher = cypher_pool[6]
+            session.run(cypher, block_idx_val=block_idx_val
+                            , page_idx_val=page_idx_val
+                            , name_val=name_val
+                            , html_val=html_val
+                            , rows_val=rows_val
+                            , doc_url_hash_val=doc_url_hash_val
+                        )
+            
+            # Link table with a section
+            # Table always has a parent section 
+
+            table_parent_val = str(tb.parent.to_text())
+            
+            if not table_parent_val == "None":
+                table_parent_hash_val = hashlib.md5(table_parent_val.encode("utf-8")).hexdigest()
+                table_parent_page_idx_val = tb.parent.page_idx
+                table_parent_block_idx_val = tb.parent.block_idx
+
+                cypher = cypher_pool[7]
+                session.run(cypher, name_val=name_val
+                                , block_idx_val=block_idx_val
+                                , parent_page_idx_val=table_parent_page_idx_val
+                                , parent_hash_val=table_parent_hash_val
+                                , parent_block_idx_val=table_parent_block_idx_val
+                                , doc_url_hash_val=doc_url_hash_val
+                            )
+
+            else:   # link table to Document
+                cypher = cypher_pool[8]
+                session.run(cypher, name_val=name_val
+                                , block_idx_val=block_idx_val
+                                , doc_url_hash_val=doc_url_hash_val
+                            )
+            countTable += 1
+
+        # **** for tb in doc.tables():
         
-            records = retrieve_graph()
-            draw_graph(records)
+        print(f'\'{doc_url_val}\' Done! Summary: ')
+        print('#Sections: ' + str(countSection))
+        print('#Chunks: ' + str(countChunk))
+        print('#Tables: ' + str(countTable))
 
-def get_extraction_chain(
-      allowed_nodes: Optional[List[str]] = None,
-      allowed_rels: Optional[List[str]] = None
-      ):
-    
-      prompt = ChatPromptTemplate.from_messages(
-          [(
-            "system",
-            f"""
-            Extract entities and relationships from the following text and format them as JSON with keys 'nodes' and 'edges'.
-            {'- Allowed Node Labels:' + ", ".join(allowed_nodes) if allowed_nodes else ""}
-            {'- Allowed Relationship Types:' + ", ".join(allowed_rels) if allowed_rels else ""}
-            """),
-              ("human", "Use the given format to extract information from the following input: {input}"),
-              ("human", "Tip: Make sure to answer in the correct format and JSON compliant"),
-          ])
-      return create_structured_output_chain(KnowledgeGraph, llm, prompt, verbose=False)
+    driver.close()
 
-def extract_and_store_graph(
-    document: Document,
-    nodes:Optional[List[str]] = None,
-    rels:Optional[List[str]]=None) -> None:
+def LoadEmbedding(label, property):
+    driver = GraphDatabase.driver(url, database=database, auth=(username, password))
 
-    extract_chain = get_extraction_chain(nodes, rels)
-    data = extract_chain.invoke(document.page_content)['function']
+    with driver.session() as session:
+        # get chunks in document, together with their section titles
+        result = session.run(f"MATCH (ch:{label}) -[:HAS_PARENT]-> (s:Section) RETURN id(ch) AS id, s.title + ' >> ' + ch.{property} AS text")
+        # call OpenAI embedding API to generate embeddings for each proporty of node
+        # for each node, update the embedding property
+        count = 0
+        for record in result:
+            id = record["id"]
+            text = record["text"]
+            
+            # For better performance, text can be batched
+            embedding = embeddings.embed_query(text)
+            
+            # key property of Embedding node differentiates different embeddings
+            cypher = "CREATE (e:Embedding) SET e.key=$key, e.value=$embedding"
+            cypher = cypher + " WITH e MATCH (n) WHERE id(n) = $id CREATE (n) -[:HAS_EMBEDDING]-> (e)"
+            session.run(cypher,key=property, embedding=embedding, id=id )
+            count = count + 1
 
-    # Construct a graph document
-    graph_document = GraphDocument(
-        nodes = [map_to_base_node(node) for node in data.nodes],
-        relationships = [map_to_base_relationship(rel) for rel in data.edges],
-        source = document
-    )
-
-    # Store information into a graph
-    neo4j_graph.add_graph_documents([graph_document])
-
-def insert_data(df_nodes, df_edges):
-
-    def create_properties(row):
-        return {key: value for key, value in row.items() if key != 'label'}
-
-    for index, row in df_nodes.iterrows():
-        row['properties'] = row.apply(create_properties, axis=1)
-    
-    ingest_graph_into_neo4j(df_nodes[['label', 'properties']], df_edges)
-
-def ingest_graph_into_neo4j(node_data_objects, relationship_data_objects):
-    # Ingest nodes
-    for node_data in node_data_objects:
-        label = ':'.join(node_data['label'])
-        properties = ', '.join(f"{key}: ${key}" for key in node_data if key not in [])
-        neo4j_graph.query(f"MERGE (n:{label} {{{properties}}})", **node_data['properties'])
-
-    # Ingest relationships
-    for rel_data in relationship_data_objects:
-        neo4j_graph.query("""
-            MATCH (source {elementId: $startNodeElementId})
-            MATCH (target {elementId: $endNodeElementId})
-            MERGE (source)-[r:{type}]->(target)
-        """, startNodeElementId=rel_data['startNodeElementId'], endNodeElementId=rel_data['endNodeElementId'], type=rel_data['type'])
-
-
-def insert_query_data(data: dict) -> None:
-    # Cypher, the query language of Neo4j, is used to import the data
-    # https://neo4j.com/docs/getting-started/cypher-intro/
-    # https://neo4j.com/docs/cypher-cheat-sheet/5/auradb-enterprise/
-    import_query = data['query']
-    neo4j_graph.query(import_query)
-
-def retrieve_graph():
-    query = """
-    MATCH (n)-[r]->(m) RETURN n, r, m
-    """
-    records = neo4j_graph.query(query)
-    return records
-
-def draw_graph(records):
-    # Create a NetworkX graph
-    G = nx.Graph()
-
-    # Process records to add nodes and edges
-    for record in records:
-        node_n = record['n']
-        node_m = record['m']
-        edge = record['r']
-
-        # Add nodes with attributes
-        G.add_node(node_n['id'], **node_n)
-        G.add_node(node_m['id'], **node_m)
+        session.close()
         
-        # Add edge with type
-        G.add_edge(edge[0]['id'], edge[2]['id'], type=edge[1])
+        print("Processed " + str(count) + " " + label + " nodes for property @" + property + ".")
+        return count
 
+initialiseNeo4j()
 
-    # Create a PyVis network
-    net = Network(notebook=True)
-    net.from_nx(G)
+uploaded_files = st.file_uploader("Choose a file", type=["pdf"], accept_multiple_files=True)
+st.write("Upload a single or multiple files in either PDF")
 
-    # Save and read graph as HTML file (streamlit can't directly display from PyVis)
-    net.show("graph.html")
-    HtmlFile = open("graph.html", "r", encoding="utf-8")
+file_location = './uploads'
+os.makedirs(file_location, exist_ok=True)
 
-    # Load HTML file in Streamlit and display it
-    source_code = HtmlFile.read()
-    components.html(source_code, height=600)
+if len(uploaded_files) is not 0:
+    if st.button('Generate Graph'):
 
-if __name__ == "__main__":
-    main()
+        for pdf_file in uploaded_files:
+            file_type = pdf_file.type
+            if file_type == "application/pdf":
+                # Save the uploaded file to the uploads directory
+                file_path = os.path.join(file_location, pdf_file.name)
+                with open(file_path, "wb") as f:
+                    f.write(pdf_file.getbuffer())
+
+        pdf_files = glob.glob(file_location + '/*.pdf')
+
+        for pdf_file in pdf_files:
+            doc = pdf_reader.read_pdf(pdf_file)
+
+            ingestDocumentNeo4j(doc, pdf_file)
+
+            LoadEmbedding("Chunk", "sentences")
+            LoadEmbedding("Table", "name")
+
+# llm_chain: LLM only response
+llm_chain = configure_llm_only_chain(llm)
+
+# rag_chain: KG augmented response
+rag_chain = configure_qa_structure_rag_chain(
+    llm, embeddings, embeddings_store_url=url, username=username, password=password
+)
+
+name = mode_select()
+
+if name == "LLM only" or name == "Disabled":
+    output_function = llm_chain
+elif name == "Vector + Graph" or name == "Enabled":
+    output_function = rag_chain
+
+display_chat()
+chat_input()

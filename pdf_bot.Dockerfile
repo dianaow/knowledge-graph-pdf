@@ -14,7 +14,6 @@ RUN pip install --upgrade -r requirements.txt
 RUN pip install -U langchain-huggingface
 
 COPY pdf_bot.py .
-COPY utils.py .
 COPY chains.py .
 
 EXPOSE 8503

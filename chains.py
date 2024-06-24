@@ -1,3 +1,4 @@
+from streamlit.logger import get_logger
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import OllamaEmbeddings
@@ -26,6 +27,8 @@ from utils import BaseLogger, extract_title_and_question
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from pyvis.network import Network
+
+logger = get_logger(__name__)
 
 def load_embedding_model(embedding_model_name: str, logger=BaseLogger(), config={}):
     if embedding_model_name == "ollama":
@@ -90,7 +93,7 @@ def load_llm(llm_name: str, logger=BaseLogger(), config={}):
 def configure_llm_only_chain(llm):
     # LLM only response
     template = """
-    You are a helpful assistant that helps a support agent with answering programming questions.
+    You are a helpful assistant that helps a support agent with answering questions.
     If you don't know the answer, just say that you don't know, you must not make up an answer.
     """
     system_message_prompt = SystemMessagePromptTemplate.from_template(template)
@@ -112,25 +115,38 @@ def configure_llm_only_chain(llm):
     return generate_llm_output
 
 
-def configure_qa_rag_chain(llm, embeddings, embeddings_store_url, username, password):
-    # RAG response
-    #   System: Always talk in pirate speech.
+def configure_qa_structure_rag_chain(llm, embeddings, embeddings_store_url, username, password):
+    # RAG response based on vector search and retrieval of structured chunks
+    
+    sample_query = """
+    // 0 - prepare question and its embedding 
+        MATCH (ch:Chunk) -[:HAS_EMBEDDING]-> (chemb) 
+        WHERE ch.block_idx = 19
+        WITH ch.sentences AS question, chemb.value AS qemb
+        // 1 - search chunk vectors
+        CALL db.index.vector.queryNodes($index_name, $k, qemb) YIELD node, score
+        // 2 - retrieve connectd chunks, sections and documents
+        WITH node AS answerEmb, score
+        MATCH (answerEmb) <-[:HAS_EMBEDDING]- (answer) -[:HAS_PARENT*]-> (s:Section)
+        WITH s, score LIMIT 1
+        MATCH (d:Document) <-[*]- (s) <-[:HAS_PARENT*]- (chunk:Chunk)
+        WITH d, s, chunk, score ORDER BY chunk.block_idx ASC
+        // 3 - prepare results
+        WITH d, collect(chunk) AS chunks, score
+        RETURN {source: d.url, page: chunks[0].page_idx} AS metadata, 
+            reduce(text = "", x IN chunks | text + x.sentences + '.') AS text, score;   
+    """
+
     general_system_template = """ 
-    Use the following pieces of context to answer the question at the end.
-    The context contains question-answer pairs and their links from Stackoverflow.
-    You should prefer information from accepted or more upvoted answers.
-    Make sure to rely on information from the answers and not on questions to provide accurate responses.
-    When you find particular answer in the context useful, make sure to cite it in the answer using the link.
+    You are a customer service agent that helps a customer with answering questions about a service.
+    Use the following context to answer the question at the end.
+    Make sure not to make any changes to the context if possible when prepare answers so as to provide accuate responses.
     If you don't know the answer, just say that you don't know, don't try to make up an answer.
     ----
     {summaries}
     ----
-    Each answer you generate should contain a section at the end of links to 
-    Stackoverflow questions and answers you found useful, which are described under Source value.
-    You can only use links to StackOverflow questions that are present in the context and always
-    add links to the end of the answer in the style of citations.
-    Generate concise answers with references sources section of links to 
-    relevant StackOverflow questions only at the end of the answer.
+    At the end of each answer you should contain metadata for relevant document in the form of (source, page).
+    For example, if context has `metadata`:(source:'docu_url', page:1), you should display ('doc_url',  1).
     """
     general_user_template = "Question:```{question}```"
     messages = [
@@ -151,88 +167,29 @@ def configure_qa_rag_chain(llm, embeddings, embeddings_store_url, username, pass
         url=embeddings_store_url,
         username=username,
         password=password,
-        database="neo4j",  # neo4j by default
-        index_name="stackoverflow",  # vector by default
-        text_node_propeymlrty="body",  # text by default
-    #     retrieval_query="""
-    # WITH node AS question, score AS similarity
-    # CALL  { with question
-    #     MATCH (question)<-[:ANSWERS]-(answer)
-    #     WITH answer
-    #     ORDER BY answer.is_accepted DESC, answer.score DESC
-    #     WITH collect(answer)[..2] as answers
-    #     RETURN reduce(str='', answer IN answers | str + 
-    #             '\n### Answer (Accepted: '+ answer.is_accepted +
-    #             ' Score: ' + answer.score+ '): '+  answer.body + '\n') as answerTexts
-    # } 
-    # RETURN '##Question: ' + question.title + '\n' + question.body + '\n' 
-    #     + answerTexts AS text, similarity as score, {source: question.link} AS metadata
-    # ORDER BY similarity ASC // so that best answers are the last
-    # """,
+        database='neo4j',  # neo4j by default
+        index_name="chunkVectorIndex",  # vector by default
+        node_label="Embedding",  # embedding node label
+        embedding_node_property="value",  # embedding value property
+        text_node_property="sentences",  # text by default
+        retrieval_query="""
+            WITH node AS answerEmb, score 
+            ORDER BY score DESC LIMIT 10
+            MATCH (answerEmb) <-[:HAS_EMBEDDING]- (answer) -[:HAS_PARENT*]-> (s:Section)
+            WITH s, answer, score
+            MATCH (d:Document) <-[*]- (s) <-[:HAS_PARENT*]- (chunk:Chunk)
+            WITH d, s, answer, chunk, score ORDER BY d.url_hash, s.title, chunk.block_idx ASC
+            // 3 - prepare results
+            WITH d, s, collect(answer) AS answers, collect(chunk) AS chunks, max(score) AS maxScore
+            RETURN {source: d.url, page: chunks[0].page_idx+1, matched_chunk_id: id(answers[0])} AS metadata, 
+                reduce(text = "", x IN chunks | text + x.sentences + '.') AS text, maxScore AS score LIMIT 3;
+    """,
     )
 
     kg_qa = RetrievalQAWithSourcesChain(
         combine_documents_chain=qa_chain,
-        retriever=kg.as_retriever(search_kwargs={"k": 2}),
+        retriever=kg.as_retriever(search_kwargs={"k": 25}),
         reduce_k_below_max_tokens=False,
-        max_tokens_limit=3375,
+        max_tokens_limit=7000,      # gpt-4
     )
     return kg_qa
-
-
-def generate_ticket(neo4j_graph, llm_chain, input_question):
-    # Get high ranked questions
-    records = neo4j_graph.query(
-        "MATCH (q:Question) RETURN q.title AS title, q.body AS body ORDER BY q.score DESC LIMIT 3"
-    )
-    questions = []
-    for i, question in enumerate(records, start=1):
-        questions.append((question["title"], question["body"]))
-    # Ask LLM to generate new question in the same style
-    questions_prompt = ""
-    for i, question in enumerate(questions, start=1):
-        questions_prompt += f"{i}. \n{question[0]}\n----\n\n"
-        questions_prompt += f"{question[1][:150]}\n\n"
-        questions_prompt += "----\n\n"
-
-    gen_system_template = f"""
-    You're an expert in formulating high quality questions. 
-    Formulate a question in the same style and tone as the following example questions.
-    {questions_prompt}
-    ---
-
-    Don't make anything up, only use information in the following question.
-    Return a title for the question, and the question post itself.
-
-    Return format template:
-    ---
-    Title: This is a new title
-    Question: This is a new question
-    ---
-    """
-    # we need jinja2 since the questions themselves contain curly braces
-    system_prompt = SystemMessagePromptTemplate.from_template(
-        gen_system_template, template_format="jinja2"
-    )
-    chat_prompt = ChatPromptTemplate.from_messages(
-        [
-            system_prompt,
-            SystemMessagePromptTemplate.from_template(
-                """
-                Respond in the following template format or you will be unplugged.
-                ---
-                Title: New title
-                Question: New question
-                ---
-                """
-            ),
-            HumanMessagePromptTemplate.from_template("{question}"),
-        ]
-    )
-    llm_response = llm_chain(
-        f"Here's the question to rewrite in the expected format: ```{input_question}```",
-        [],
-        chat_prompt,
-    )
-    new_title, new_question = extract_title_and_question(llm_response["answer"])
-    return (new_title, new_question)
