@@ -1,5 +1,4 @@
 services:
-
   llm: &llm
     image: ollama/ollama:latest
     profiles: ["linux"]
@@ -39,7 +38,7 @@ services:
       - $PWD/data:/data
     environment:
       - NEO4J_AUTH=${NEO4J_USERNAME-neo4j}/${NEO4J_PASSWORD-password}
-      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
       - NEO4J_db_tx__log_rotation_retention__policy=false
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
     healthcheck:
@@ -91,25 +90,5 @@ services:
     ports:
       - 8503:8503
 
-    build:
-      context: .
-      dockerfile: front-end.Dockerfile
-    x-develop:
-      watch:
-        - action: sync
-          path: ./front-end
-          target: /app
-          ignore:
-            - ./front-end/node_modules/
-        - action: rebuild
-          path: ./front-end/package.json
-    depends_on:
-      api:
-        condition: service_healthy
-    networks:
-      - net
-    ports:
-      - 8505:8505
-      
 networks:
   net:

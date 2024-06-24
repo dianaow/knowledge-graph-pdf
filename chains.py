@@ -3,30 +3,26 @@ from streamlit.logger import get_logger
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.embeddings import BedrockEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-
 from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatOllama
 from langchain_community.chat_models import BedrockChat
-
-from langchain_community.graphs import Neo4jGraph
-
 from langchain_community.vectorstores import Neo4jVector
-
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-
 from langchain.prompts import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
     SystemMessagePromptTemplate
 )
-
 from typing import List, Any
-from utils import BaseLogger, extract_title_and_question
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from pyvis.network import Network
+
+class BaseLogger:
+    def __init__(self) -> None:
+        self.info = print
+
 
 logger = get_logger(__name__)
 
